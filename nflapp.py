@@ -4,6 +4,7 @@ import time
 import asyncio
 import logging
 import sqlite3
+import threading
 from datetime import datetime
 from typing import List, Optional, Callable, Dict, Any, Tuple
 from dataclasses import dataclass, field
@@ -11,71 +12,38 @@ import aiohttp
 from argon2 import PasswordHasher
 from argon2.exceptions import VerifyMismatchError
 
-# Configure professional diagnostic logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[logging.StreamHandler(sys.stdout)]
-)
-
-# Environment and Configuration Management
-NFL_API_KEY = os.getenv("NFL_API_KEY", "")
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s',
+                    handlers=[logging.StreamHandler(sys.stdout)])
 DB_NAME = os.getenv("NFL_DB_NAME", "nfl_app.db")
-CACHE_TTL_SECONDS = 300  # 5 minutes caching window
-MAX_RETRIES = 3
 
 
 class User:
-    """Integrated Active Record style data representation layer."""
-
-    def __init__(self, db_id: Optional[int], username: str, password_hash: str, favorite_team: Optional[str] = None, score: float = 0.0, is_admin: bool = False):
+    def __init__(self, db_id: Optional[int], username: str, password_hash: str, score: float = 0.0):
         self.id = db_id
         self.username = username.strip()
         self.password_hash = password_hash
-        self.favorite_team = favorite_team.upper() if favorite_team else None
         self.score = score
-        self.is_admin = is_admin
-
-    def set_favorite(self, team: str):
-        self.favorite_team = team.upper() if team.strip() else None
-
-    def update_score(self):
-        self.score += 1.0
-
-    def save(self, conn: sqlite3.Connection):
-        """Saves or updates state metrics safely using transaction cursors."""
-        cursor = conn.cursor()
-        if self.id is None:
-            cursor.execute(
-                "INSERT INTO users (username, password_hash, favorite_team, score, is_admin) VALUES (?, ?, ?, ?, ?)",
-                (self.username, self.password_hash, self.favorite_team,
-                 self.score, 1 if self.is_admin else 0)
-            )
-            self.id = cursor.lastrowid
-        else:
-            cursor.execute(
-                "UPDATE users SET username=?, password_hash=?, favorite_team=?, score=?, is_admin=? WHERE id=?",
-                (self.username, self.password_hash, self.favorite_team,
-                 self.score, 1 if self.is_admin else 0, self.id)
-            )
-        conn.commit()
 
     @staticmethod
     def get_user(username: str, conn: sqlite3.Connection) -> Optional['User']:
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT id, username, password_hash, favorite_team, score, is_admin FROM users WHERE username=?", (username.strip(),))
+            "SELECT id, username, password_hash, score FROM users WHERE username=?", (username.strip(),))
         user_data = cursor.fetchone()
         if user_data:
-            return User(
-                db_id=user_data[0],
-                username=user_data[1],
-                password_hash=user_data[2],
-                favorite_team=user_data[3],
-                score=user_data[4],
-                is_admin=bool(user_data[5])
-            )
+            return User(db_id=user_data[0], username=user_data[1], password_hash=user_data[2], score=user_data[3])
         return None
+
+    def save(self, conn: sqlite3.Connection):
+        cursor = conn.cursor()
+        if self.id is None:
+            cursor.execute("INSERT INTO users (username, password_hash, score) VALUES (?, ?, ?)",
+                           (self.username, self.password_hash, self.score))
+            self.id = cursor.lastrowid
+        else:
+            cursor.execute("UPDATE users SET username=?, password_hash=?, score=? WHERE id=?",
+                           (self.username, self.password_hash, self.score, self.id))
+        conn.commit()
 
 
 @dataclass
@@ -84,8 +52,7 @@ class HotTake:
     text: str
     votes: int = 0
     downvotes: int = 0
-    created_at: float = field(
-        default_factory=lambda: datetime.now().timestamp())
+    created_at: float = field(default_factory=lambda: time.time())
     id: Optional[int] = None
 
     def upvote(self):
@@ -94,15 +61,12 @@ class HotTake:
     def downvote(self):
         self.downvotes += 1
 
-    def score(self) -> float:
-        """Dynamic time-decay popularity formula logic."""
-        age_hours = (datetime.now().timestamp() - self.created_at) / 3600
+    def ranking_score(self) -> float:
+        age_hours = (time.time() - self.created_at) / 3600
         return (self.votes - self.downvotes) / ((age_hours + 2) ** 1.5)
 
 
 class CryptoManager:
-    """Handles secure cryptographic parameters natively utilizing Argon2id."""
-
     def __init__(self):
         self.ph = PasswordHasher()
 
@@ -120,182 +84,180 @@ class CryptoManager:
 
 
 class API:
-    """Asynchronous pipeline client optimized with an in-memory caching mechanism."""
-
     def __init__(self):
-        self.cache: Dict[str, Dict[str, Any]] = {}
+        self.session = None
 
-    def _get_cached_data(self, key: str) -> Optional[Any]:
-        if key in self.cache:
-            entry = self.cache[key]
-            if time.time() - entry["timestamp"] < CACHE_TTL_SECONDS:
-                return entry["data"]
-        return None
+    async def _get_session(self):
+        if not self.session or self.session.closed:
+            self.session = aiohttp.ClientSession()
+        return self.session
 
-    def _set_cache_data(self, key: str, data: Any):
-        self.cache[key] = {"data": data, "timestamp": time.time()}
-
-    async def _fetch_with_backoff(self, url: str, headers: Optional[Dict[str, str]] = None) -> Optional[Any]:
-        async with aiohttp.ClientSession() as session:
-            for attempt in range(1, MAX_RETRIES + 1):
-                try:
-                    async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=5)) as response:
-                        if response.status == 200:
-                            return await response.json()
-                        elif response.status in [429, 500, 502, 503, 504]:
-                            logging.warning(
-                                f"Transient HTTP {response.status} code warning on attempt {attempt}")
-                        else:
-                            logging.error(
-                                f"Fatal HTTP handling exception error encountered: {response.status}")
-                            return None
-                except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-                    logging.warning(
-                        f"Network request timeout on retry cycle iteration {attempt}: {e}")
-
-                if attempt < MAX_RETRIES:
-                    await asyncio.sleep(2 ** attempt)
-            return None
-
-    async def fetch_news(self) -> List[dict]:
-        cached = self._get_cached_data("news")
-        if cached:
-            return cached
-
-        url = "https://site.api.espn.com/apis/site/v2/sports/football/nfl/news"
-        raw_data = await self._fetch_with_backoff(url)
-        if not raw_data:
-            return []
-
-        try:
-            normalized_articles = [
-                {
-                    "headline": item.get("headline", ""),
-                    "link": item.get("links", {}).get("web", {}).get("href", "")
-                }
-                for item in raw_data.get("articles", [])
-            ]
-            self._set_cache_data("news", normalized_articles)
-            return normalized_articles
-        except Exception as e:
-            logging.error(
-                f"Error structuring raw JSON values data models mapping: {e}")
-            return []
+    async def close(self):
+        if self.session and not self.session.closed:
+            await self.session.close()
 
     async def fetch_scores(self) -> List[dict]:
-        if not NFL_API_KEY:
-            logging.warning(
-                "Scores query bypassed: Missing NFL_API_KEY tokens.")
-            return []
-
-        cached = self._get_cached_data("scores")
-        if cached:
-            return cached
-
-        url = "https://api.sportsdata.io/v3/nfl/scores/json/ScoresByWeek/2025REG/1"
-        headers = {"Ocp-Apim-Subscription-Key": NFL_API_KEY}
-
-        raw_scores = await self._fetch_with_backoff(url, headers=headers)
-        if raw_scores:
-            self._set_cache_data("scores", raw_scores)
-            return raw_scores
+        try:
+            session = await self._get_session()
+            url = "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard"
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as r:
+                if r.status == 200:
+                    data = await r.json()
+                    games = []
+                    for e in data.get("events", []):
+                        comp = e["competitions"][0]
+                        teams = comp["competitors"]
+                        away_team = teams[1] if teams[0]["homeAway"] == "home" else teams[0]
+                        home_team = teams[0] if teams[0]["homeAway"] == "home" else teams[1]
+                        games.append({
+                            "game_id": e["id"],
+                            "game_name": e.get("name", "NFL Game"),
+                            "AwayTeam": away_team["team"]["abbreviation"],
+                            "HomeTeam": home_team["team"]["abbreviation"],
+                            "AwayScore": int(away_team.get("score", 0)),
+                            "HomeScore": int(home_team.get("score", 0))
+                        })
+                    return games
+        except Exception as e:
+            logging.error(f"Error extracting score matrix elements: {e}")
         return []
+
+    async def yield_news(self):
+        try:
+            session = await self._get_session()
+            url = "https://site.api.espn.com/apis/site/v2/sports/football/nfl/news"
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as r:
+                if r.status == 200:
+                    data = await r.json()
+                    for a in data.get("articles", []):
+                        yield {
+                            "headline": a.get("headline"),
+                            "link": a.get("links", {}).get("web", {}).get("href"),
+                        }
+        except Exception as e:
+            logging.error(
+                f"Async generator pipeline encounter error streaming data models: {e}")
 
 
 class Database:
-    """Manages explicit parameter serialization loops and data table initialization."""
-
     def __init__(self):
-        self.conn = sqlite3.connect(DB_NAME)
+        self.conn = sqlite3.connect(DB_NAME, check_same_thread=False)
+        self.lock = threading.Lock()
         self.create_tables()
-        self._seed_admin_account()
 
     def create_tables(self):
-        with self.conn:
-            self.conn.execute("""
-                CREATE TABLE IF NOT EXISTS users (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    username TEXT UNIQUE NOT NULL,
-                    password_hash TEXT NOT NULL,
-                    favorite_team TEXT,
-                    score REAL DEFAULT 0.0,
-                    is_admin INTEGER DEFAULT 0
-                )
-            """)
-            self.conn.execute("""
-                CREATE TABLE IF NOT EXISTS hot_takes (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user TEXT NOT NULL,
-                    text TEXT NOT NULL,
-                    votes INTEGER DEFAULT 0,
-                    downvotes INTEGER DEFAULT 0,
-                    created_at REAL NOT NULL
-                )
-            """)
-
-    def _seed_admin_account(self):
-        cursor = self.conn.cursor()
-        try:
-            cursor.execute("SELECT 1 FROM users WHERE username = 'admin'")
-            if not cursor.fetchone():
-                hashed = CryptoManager().hash_password("admin123")
-                # Using INSERT OR IGNORE safely prevents collision crashes
-                self.conn.execute(
-                    "INSERT OR IGNORE INTO users (username, password_hash, favorite_team, score, is_admin) VALUES (?, ?, ?, ?, ?)",
-                    ("admin", hashed, "NFL", 0.0, 1)
-                )
-                self.conn.commit()
-                logging.info(
-                    "Platform administrative baseline user verified/seeded.")
-        except sqlite3.OperationalError as e:
-            logging.error(
-                f"Schema mismatch detected: {e}. Dropping the old nfl_app.db file is required to rebuild table columns.")
-
-    def save_hot_take(self, take: HotTake):
-        try:
+        with self.lock:
             with self.conn:
-                cursor = self.conn.cursor()
-                cursor.execute(
-                    "INSERT INTO hot_takes (user, text, votes, downvotes, created_at) VALUES (?, ?, ?, ?, ?)",
-                    (take.user, take.text, take.votes,
-                     take.downvotes, take.created_at)
-                )
-                take.id = cursor.lastrowid
-        except sqlite3.Error as e:
-            logging.error(
-                f"Database insertion exception writing hot take structure row: {e}")
+                self.conn.execute("""
+                    CREATE TABLE IF NOT EXISTS users (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        username TEXT UNIQUE,
+                        password_hash TEXT,
+                        score REAL DEFAULT 0
+                    )
+                """)
+                self.conn.execute("""
+                    CREATE TABLE IF NOT EXISTS hot_takes (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        user TEXT,
+                        text TEXT,
+                        votes INTEGER,
+                        downvotes INTEGER,
+                        created_at REAL
+                    )
+                """)
+                self.conn.execute("""
+                    CREATE TABLE IF NOT EXISTS predictions (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        user TEXT,
+                        game_id TEXT,
+                        game_name TEXT,
+                        pred_home INTEGER,
+                        pred_away INTEGER,
+                        actual_home INTEGER DEFAULT NULL,
+                        actual_away INTEGER DEFAULT NULL,
+                        error INTEGER DEFAULT NULL
+                    )
+                """)
+                self.conn.execute("""
+                    CREATE TABLE IF NOT EXISTS prediction_outcomes (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        username TEXT,
+                        game_id TEXT,
+                        pred_home INTEGER,
+                        pred_away INTEGER,
+                        actual_home INTEGER,
+                        actual_away INTEGER,
+                        is_correct INTEGER
+                    )
+                """)
 
-    def update_take_votes(self, take: HotTake):
-        if take.id is None:
-            return
-        try:
+    def save_take(self, take: HotTake):
+        with self.lock:
+            with self.conn:
+                cur = self.conn.execute("INSERT INTO hot_takes (user, text, votes, downvotes, created_at) VALUES (?, ?, ?, ?, ?)", (
+                    take.user, take.text, take.votes, take.downvotes, take.created_at))
+                take.id = cur.lastrowid
+
+    def update_votes(self, take_id: int, votes: int, downvotes: int):
+        with self.lock:
             with self.conn:
                 self.conn.execute(
-                    "UPDATE hot_takes SET votes=?, downvotes=? WHERE id=?", (take.votes, take.downvotes, take.id))
-        except sqlite3.Error as e:
-            logging.error(
-                f"Database runtime failure updating interaction scores table: {e}")
+                    "UPDATE hot_takes SET votes=?, downvotes=? WHERE id=?", (votes, downvotes, take_id))
 
-    def load_all_takes(self) -> List[HotTake]:
-        try:
-            cursor = self.conn.cursor()
-            cursor.execute(
-                "SELECT user, text, votes, downvotes, created_at, id FROM hot_takes")
-            return [HotTake(user=r[0], text=r[1], votes=r[2], downvotes=r[3], created_at=r[4], id=r[5]) for r in cursor.fetchall()]
-        except sqlite3.Error as e:
-            logging.error(
-                f"Database error loading data profiles context rows: {e}")
-            return []
+    def get_takes(self) -> List[HotTake]:
+        with self.lock:
+            rows = self.conn.execute(
+                "SELECT id, user, text, votes, downvotes, created_at FROM hot_takes").fetchall()
+        return [HotTake(id=r[0], user=r[1], text=r[2], votes=r[3], downvotes=r[4], created_at=r[5]) for r in rows]
 
-    def clear_all_metrics(self):
-        try:
+    def save_prediction(self, user: str, game_id: str, game_name: str, home: int, away: int):
+        with self.lock:
             with self.conn:
-                self.conn.execute("UPDATE users SET score = 0.0")
-                self.conn.execute("DELETE FROM hot_takes")
-            logging.info("Platform tracking entities tables reset completed.")
-        except sqlite3.Error as e:
-            logging.error(
-                f"Database failure executing table truncate optimization matrices: {e}")
+                cur = self.conn.cursor()
+                cur.execute(
+                    "SELECT id FROM predictions WHERE user=? AND game_id=? AND error IS NULL", (user, game_id))
+                existing = cur.fetchone()
+                if existing:
+                    self.conn.execute(
+                        "UPDATE predictions SET pred_home=?, pred_away=? WHERE id=?", (home, away, existing[0]))
+                else:
+                    self.conn.execute("INSERT INTO predictions (user, game_id, game_name, pred_home, pred_away) VALUES (?, ?, ?, ?, ?)", (
+                        user, game_id, game_name, home, away))
+
+    def settle_predictions(self, game_id: str, home: int, away: int):
+        with self.lock:
+            with self.conn:
+                rows = self.conn.execute(
+                    "SELECT id, pred_home, pred_away, user FROM predictions WHERE game_id=? AND error IS NULL", (game_id,)).fetchall()
+                for r in rows:
+                    pid, ph, pa, username = r
+                    error = abs(ph - home) + abs(pa - away)
+                    self.conn.execute(
+                        "UPDATE predictions SET actual_home=?, actual_away=?, error=? WHERE id=?", (home, away, error, pid))
+                    is_correct = 1 if (ph == home and pa == away) else 0
+                    self.conn.execute("INSERT INTO prediction_outcomes (username, game_id, pred_home, pred_away, actual_home, actual_away, is_correct) VALUES (?, ?, ?, ?, ?, ?, ?)", (
+                        username, game_id, ph, pa, home, away, is_correct))
+
+    def get_user_performance(self, username: str) -> Dict[str, int]:
+        with self.lock:
+            results = self.conn.execute(
+                "SELECT is_correct, COUNT(*) FROM prediction_outcomes WHERE username = ? GROUP BY is_correct", (username,)).fetchall()
+        performance = {'total_predictions': 0,
+                       'correct_predictions': 0, 'incorrect_predictions': 0}
+        for row in results:
+            if row[0] == 1:
+                performance['correct_predictions'] += row[1]
+            else:
+                performance['incorrect_predictions'] += row[1]
+            performance['total_predictions'] += row[1]
+        return performance
+
+    def leaderboard(self) -> List[Dict[str, Any]]:
+        with self.lock:
+            rows = self.conn.execute(
+                "SELECT user, COUNT(*), AVG(error) FROM predictions WHERE error IS NOT NULL GROUP BY user ORDER BY AVG(error) ASC LIMIT 20").fetchall()
+        return [{"user": r[0], "total": r[1], "avg_error": r[2]} for r in rows]
 
 
 class NFLApp:
@@ -314,17 +276,14 @@ class NFLApp:
         if not username:
             return
         password = input("Enter password: ").strip()
-
         user = User.get_user(username, self.db.conn)
-
-        # Verify using our secure cryptographic interface layer
         if user and self.crypto.verify_password(password, user.password_hash):
             self.current_user = user
-            print(f"Logged in as {username}")
+            print(f"\nLogged in safely as: {username}")
         else:
             if not user:
                 choice = input(
-                    "User footprint absent. Initialize account credentials row? (y/n): ").strip().lower()
+                    "\nUser profile absent. Initialize account credentials row? (y/n): ").strip().lower()
                 if choice == 'y':
                     if len(password) < 6:
                         print(
@@ -335,167 +294,191 @@ class NFLApp:
                                     password_hash=hashed_pw)
                     new_user.save(self.db.conn)
                     self.current_user = new_user
-                    print(f"User created. Logged in as {username}")
+                    print(f"User matrix registered. Logged in as {username}")
             else:
-                print("Invalid credentials")
+                print("Invalid authentication parameters.")
 
     async def show_news(self):
-        news = await self.api.fetch_news()
-        if not news:
-            print("Unable to collect remote news entries from provider.")
-            return
-
-        if self.current_user and self.current_user.favorite_team:
-            fav = self.current_user.favorite_team.lower()
-            news.sort(key=lambda x: fav in x["headline"].lower(), reverse=True)
-
-        print("\nNEWS")
-        for i, item in enumerate(news[:5], 1):
-            print(f"{i}. {item['headline']}")
-            print(f"   Link: {item['link']}")
+        print("\n=== LATEST NFL NEWS (STREAMED) ===")
+        count = 0
+        async for article in self.api.yield_news():
+            count += 1
+            print(f"{count}. {article['headline']}")
+            print(f"   Link: {article['link']}")
+            if count >= 5:
+                break
+        if count == 0:
+            print(
+                "No real-time articles could be streamed from provider API context channels.")
 
     async def show_scores(self):
-        scores = await self.api.fetch_scores()
-        if not scores:
+        games = await self.api.fetch_scores()
+        if not games:
             print("Unable to collect scoreboard parameters from network channel.")
             return
+        print("\n=== CURRENT SCOREBOARD ===")
+        for i, g in enumerate(games, 1):
+            print(f"[{i}] {g['game_name']}")
+            print(
+                f"    {g['AwayTeam']} {g['AwayScore']} @ {g['HomeTeam']} {g['HomeScore']}")
+            print("-" * 35)
+        return games
 
-        print("\nSCORES")
-        for g in scores[:5]:
-            print(f"{g.get('AwayTeam', 'UNK')} @ {g.get('HomeTeam', 'UNK')}")
-            print(f"{g.get('AwayScore', 0)} - {g.get('HomeScore', 0)}")
-            print("-" * 25)
+    async def make_prediction(self):
+        if not self.current_user:
+            print(
+                "Authentication routing blocked: Login required to construct predictions.")
+            return
+        games = await self.show_scores()
+        if not games:
+            return
+        try:
+            choice = int(
+                input("\nSelect game line number identifier to predict: ")) - 1
+            if 0 <= choice < len(games):
+                target = games[choice]
+                pred_away = int(
+                    input(f"Enter predicted score for {target['AwayTeam']}: "))
+                pred_home = int(
+                    input(f"Enter predicted score for {target['HomeTeam']}: "))
+                self.db.save_prediction(
+                    user=self.current_user.username, game_id=target['game_id'], game_name=target['game_name'], home=pred_home, away=pred_away)
+                print("Game prediction records logged successfully.")
+            else:
+                print("Selection context out of bounds.")
+        except ValueError:
+            print("Numeric processing exception triggered. Action aborted.")
+
+    async def evaluate_live_scores(self):
+        print("\nSynchronizing engine metrics against remote scoreboard updates...")
+        games = await self.api.fetch_scores()
+        if not games:
+            print("Sync cycle skipped.")
+            return
+        for g in games:
+            if g['AwayScore'] > 0 or g['HomeScore'] > 0:
+                self.db.settle_predictions(
+                    g['game_id'], g['HomeScore'], g['AwayScore'])
+        print("Data updates verified.")
+
+    def show_prediction_leaderboard(self):
+        leaders = self.db.leaderboard()
+        print("\n=== ACCURACY LEADERBOARD (LOWER ERROR IS BETTER) ===")
+        if not leaders:
+            print("No settled prediction records parsed in the current system timeline.")
+            return
+        for i, row in enumerate(leaders, 1):
+            print(
+                f"{i}. User: {row['user']} | Settled Games: {row['total']} | Avg Error Point Margin: {row['avg_error']:.2f}")
+
+    def display_current_user_performance(self):
+        if not self.current_user:
+            print(
+                "Authentication routing blocked: Login required to review profile performance.")
+            return
+        perf = self.db.get_user_performance(self.current_user.username)
+        print(f"\nUser: {self.current_user.username}")
+        print(f"Total Predictions: {perf['total_predictions']}")
+        if perf['total_predictions'] > 0:
+            print(
+                f"Correct Predictions: {perf['correct_predictions']} ({perf['correct_predictions'] / perf['total_predictions'] * 100:.2f}%)")
+            print(
+                f"Incorrect Predictions: {perf['incorrect_predictions']} ({perf['incorrect_predictions'] / perf['total_predictions'] * 100:.2f}%)")
+        else:
+            print("Correct Predictions: 0 (0.00%)")
+            print("Incorrect Predictions: 0 (0.00%)")
 
     async def add_take(self):
         if not self.current_user:
             print("Login required to proceed with this task selection choice.")
             return
-        text = input("Enter take: ").strip()
+        text = input("Enter take text content: ").strip()
         if not text:
             return
-
         take = HotTake(user=self.current_user.username, text=text)
         for hook in self.hooks:
             hook(take)
-
-        self.db.save_hot_take(take)
-        self.current_user.update_score()
-        self.current_user.save(self.db.conn)
+        self.db.save_take(take)
         print("Hot take broadcast verified.")
 
     def show_takes(self) -> List[HotTake]:
-        print("\nHOT TAKES")
-        takes = self.db.load_all_takes()
-        ranked = sorted(takes, key=lambda t: t.score(), reverse=True)
-
+        print("\n=== HOT TAKES RANKED BY TIME-DECAY POPULARITY ===")
+        takes = self.db.get_takes()
+        ranked = sorted(takes, key=lambda t: t.ranking_score(), reverse=True)
         if not ranked:
-            print("No hot takes present in system timeline.")
+            print(
+                "No active hot takes tracking inside database instance storage objects.")
         for i, t in enumerate(ranked, 1):
             print(
-                f"{i}. [{t.score():.2f}] {t.user}: {t.text} (Votes: +{t.votes}/-{t.downvotes})")
+                f"{i}. [{t.ranking_score():.2f}] {t.user}: {t.text} (Votes: +{t.votes}/-{t.downvotes})")
         return ranked
 
-    async def upvote_take(self):
+    async def vote_take_interface(self, direction: str):
         ranked = self.show_takes()
         if not ranked:
             return
         try:
             choice = int(
-                input("\nSelect take line identifier to upvote: ")) - 1
+                input(f"\nSelect take index to {direction}vote: ")) - 1
             if 0 <= choice < len(ranked):
                 target = ranked[choice]
-                target.upvote()
-                self.db.update_take_votes(target)
-                print("Upvote logged.")
+                if direction == "up":
+                    target.upvote()
+                else:
+                    target.downvote()
+                if target.id is None:
+                    print("Unable to update vote record: invalid take identifier.")
+                    return
+                self.db.update_votes(target.id, target.votes, target.downvotes)
+                print(
+                    f"{direction.capitalize()}vote logged matrix records update complete.")
             else:
-                print("Selection context out of bounds index array.")
+                print("Selection index out of range bounds array template.")
         except ValueError:
-            print("Numeric selector parsing expected.")
-
-    async def downvote_take(self):
-        ranked = self.show_takes()
-        if not ranked:
-            return
-        try:
-            choice = int(
-                input("\nSelect take line identifier to downvote: ")) - 1
-            if 0 <= choice < len(ranked):
-                target = ranked[choice]
-                target.downvote()
-                self.db.update_take_votes(target)
-                print("Downvote logged.")
-            else:
-                print("Selection context out of bounds index array.")
-        except ValueError:
-            print("Numeric selector parsing expected.")
-
-    async def set_favorite_team(self):
-        if not self.current_user:
-            print("Login required to proceed with this task selection choice.")
-            return
-        team = input("Enter team tracking tag abbreviation: ").strip()
-        if team:
-            self.current_user.set_favorite(team)
-            self.current_user.save(self.db.conn)
-            print(
-                f"Personal filter criteria prioritized: {self.current_user.favorite_team}")
-
-    async def administrative_purge_routine(self):
-        if self.current_user and self.current_user.is_admin:
-            confirm = input(
-                "Confirm destruction of platform metrics? (y/n): ").strip().lower()
-            if confirm == 'y':
-                self.db.clear_all_metrics()
-                # Update current active user session instance in-memory to match database state
-                self.current_user.score = 0.0
-                print("Standings data models cleared.")
-        else:
-            print(
-                "Access Restriction Notice: Administrative parameters verification error.")
+            print("Numeric validation expected.")
 
     async def menu(self):
         while True:
             profile_tag = self.current_user.username if self.current_user else "Unauthenticated Guest"
-            admin_extension = " [SYS ADMIN]" if (
-                self.current_user and self.current_user.is_admin) else ""
-
             print(f"\n================ NFL CORE APP ENGINE ================")
-            print(f" Current Session Context: {profile_tag}{admin_extension}")
+            print(f" Current Session Context: {profile_tag}")
             print("-----------------------------------------------------")
-            print("1. Login")
-            print("2. Show News")
-            print("3. Show Scores")
-            print("4. Show Hot Takes")
-            print("5. Add Custom Take")
-            print("6. Upvote Target Take")
-            print("7. Downvote Target Take")
-            print("8. Configure Favorite Team Filter")
-            print("9. Exit")
-            if self.current_user and self.current_user.is_admin:
-                print("0. Administrative System Data Purge Routine")
-
-            choice = input("\nEnter choice (0-9): ").strip()
-
+            print("1. Login / Create Account")
+            print("2. Show Streaming News")
+            print("3. Show Live Scores & Sync Predictions")
+            print("4. Submit Score Prediction Model")
+            print("5. View Prediction Leaderboard Accuracy")
+            print("6. View My Prediction Stats")
+            print("7. Show Ranked Hot Takes")
+            print("8. Add Custom Take Row")
+            print("9. Upvote Hot Take")
+            print("10. Downvote Hot Take")
+            print("0. Exit Engine Pipeline")
+            choice = input("\nEnter choice (0-10): ").strip()
             if choice == "1":
                 await self.login()
             elif choice == "2":
                 await self.show_news()
             elif choice == "3":
                 await self.show_scores()
+                await self.evaluate_live_scores()
             elif choice == "4":
-                self.show_takes()
+                await self.make_prediction()
             elif choice == "5":
-                await self.add_take()
+                self.show_prediction_leaderboard()
             elif choice == "6":
-                await self.upvote_take()
+                self.display_current_user_performance()
             elif choice == "7":
-                await self.downvote_take()
+                self.show_takes()
             elif choice == "8":
-                await self.set_favorite_team()
-            elif choice == "0":
-                await self.administrative_purge_routine()
+                await self.add_take()
             elif choice == "9":
-                print("Exiting the application framework pipeline safely.")
+                await self.vote_take_interface("up")
+            elif choice == "10":
+                await self.vote_take_interface("down")
+            elif choice == "0":
+                print("Closing processing infrastructure safely. Goodbye.")
+                await self.api.close()
                 break
             else:
                 print("Invalid choice configuration option mapping template.")
@@ -503,13 +486,16 @@ class NFLApp:
 
 async def main():
     app = NFLApp()
-    # Apply input formatting hook logic limiting raw character sets inputs sizing bounds
     app.register_hook(lambda t: setattr(t, "text", t.text.strip()[:200]))
     await app.menu()
-
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
         sys.exit(0)
+
+
+def create_components():
+    engine = NFLApp()
+    return engine.db, engine.api, engine.crypto
