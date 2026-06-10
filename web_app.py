@@ -2,11 +2,14 @@ import os
 import sys
 import logging
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from typing import List, Literal, Optional
+from typing import List, Literal, Optional, cast
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 from nflapp import NFLApp, HotTake
+from models import DBUser, DBHotTake
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("web_engine")
@@ -19,6 +22,7 @@ async def lifespan(app: FastAPI):
     db = nfl_engine.db
     api = nfl_engine.api
     crypto = nfl_engine.crypto
+    await db.create_tables()
     logger.info("NFL Core App Web Engine initialized inside active loop.")
     yield
     await api.close()
@@ -65,37 +69,37 @@ class SettleRequest(BaseModel):
 
 
 @app.post("/users")
-def register(data: UserAuth):
-    with db.lock:
-        existing = db.conn.execute(
-            "SELECT 1 FROM users WHERE username=?", (data.username.strip(),),).fetchone()
+async def register(data: UserAuth):
+    async with db.async_session() as session:
+        res = await session.execute(select(DBUser).where(DBUser.username == data.username.strip()))
+        existing = res.scalar_one_or_none()
         if existing:
             raise HTTPException(status_code=400, detail="User already exists")
         hashed = crypto.hash_password(data.password)
-        db.conn.execute("INSERT INTO users (username, password_hash) VALUES (?, ?)",
-                        (data.username.strip(), hashed),)
-        db.conn.commit()
+        session.add(
+            DBUser(username=data.username.strip(), password_hash=hashed))
+        await session.commit()
     return {"message": "User created successfully"}
 
 
 @app.post("/login")
-def login(data: UserAuth):
-    with db.lock:
-        user = db.conn.execute(
-            "SELECT username, password_hash FROM users WHERE username=?", (data.username.strip(),),).fetchone()
+async def login(data: UserAuth):
+    async with db.async_session() as session:
+        res = await session.execute(select(DBUser).where(DBUser.username == data.username.strip()))
+        user = res.scalar_one_or_none()
     if not user:
         raise HTTPException(
             status_code=404, detail="User profile footprint absent")
-    username, pw_hash = user
-    if not crypto.verify_password(data.password, pw_hash):
+    stored_hash = cast(str, user.password_hash)
+    if not crypto.verify_password(data.password, stored_hash):
         raise HTTPException(
             status_code=401, detail="Invalid credential parameters")
-    return {"message": f"Welcome {username}", "authenticated": True}
+    return {"message": f"Welcome {user.username}", "authenticated": True}
 
 
 @app.get("/")
 def root():
-    return {"status": "API running", "database_connected": db.conn is not None}
+    return {"status": "API running", "database_connected": db.engine is not None}
 
 
 @app.get("/scores")
@@ -105,12 +109,8 @@ async def scores():
         if games and isinstance(games, list):
             for g in games:
                 if all(k in g for k in ('game_id', 'HomeScore', 'AwayScore')):
-                    try:
-                        if g['AwayScore'] > 0 or g['HomeScore'] > 0:
-                            db.settle_predictions(
-                                g['game_id'], g['HomeScore'], g['AwayScore'])
-                    except Exception as db_err:
-                        continue
+                    if g['AwayScore'] > 0 or g['HomeScore'] > 0:
+                        await db.settle_predictions(g['game_id'], g['HomeScore'], g['AwayScore'])
         return games
     except Exception as e:
         raise HTTPException(
@@ -131,9 +131,9 @@ async def news():
 
 
 @app.get("/takes")
-def get_takes():
+async def get_takes():
     try:
-        takes = db.get_takes()
+        takes = await db.get_takes()
         if not takes:
             return []
         ranked = sorted(takes, key=lambda t: t.ranking_score()
@@ -144,51 +144,61 @@ def get_takes():
 
 
 @app.post("/takes")
-def add_take(data: HotTakeCreate):
+async def add_take(data: HotTakeCreate):
     take = HotTake(user=data.username, text=data.text.strip()[:200])
-    db.save_take(take)
+    await db.save_take(take)
     return {"message": "Hot take broadcast saved"}
 
 
 @app.post("/vote")
-def vote(data: VoteRequest):
-    with db.lock:
-        row = db.conn.execute(
-            "SELECT votes, downvotes FROM hot_takes WHERE id=?", (data.id,)).fetchone()
+async def vote(data: VoteRequest):
+    async with db.async_session() as session:
+        res = await session.execute(select(DBHotTake).where(DBHotTake.id == data.id))
+        row = res.scalar_one_or_none()
     if not row:
         raise HTTPException(
             status_code=404, detail="Target hot take item row not found")
-    votes, downs = row
+    current_votes = int(cast(int, row.votes))
+    current_downvotes = int(cast(int, row.downvotes))
     if data.type == "up":
-        votes += 1
+        current_votes += 1
     else:
-        downs += 1
-    db.update_votes(data.id, votes, downs)
+        current_downvotes += 1
+    await db.update_votes(data.id, current_votes, current_downvotes)
     return {"message": f"{data.type}vote logged successfully"}
 
 
 @app.post("/predict")
-def predict(data: PredictionCreate):
-    db.save_prediction(user=data.username, game_id=data.game_id,
-                       game_name=data.game_name, home=data.home, away=data.away)
+async def predict(data: PredictionCreate):
+    await db.save_prediction(user=data.username, game_id=data.game_id, game_name=data.game_name, home=data.home, away=data.away)
     return {"message": "Game prediction record registered"}
 
 
 @app.post("/settle")
-def settle(data: SettleRequest):
-    db.settle_predictions(game_id=data.game_id, home=data.home, away=data.away)
+async def settle(data: SettleRequest):
+    await db.settle_predictions(game_id=data.game_id, home=data.home, away=data.away)
     return {"message": "Predictions settled and point margins evaluated"}
 
 
 @app.get("/performance/{username}")
-def performance(username: str):
+async def performance(username: str):
     try:
-        return db.get_user_performance(username)
+        return await db.get_user_performance(username)
     except Exception as e:
         raise HTTPException(
             status_code=500, detail="Internal server error parsing stats context")
 
 
 @app.get("/leaderboard")
-def leaderboard():
-    return db.leaderboard()
+async def leaderboard():
+    return await db.leaderboard()
+
+
+@app.get("/items/")
+async def read_items(session: AsyncSession = Depends(lambda: nfl_engine.db.async_session())):
+    try:
+        items = await session.execute(select(DBHotTake))
+        return items.scalars().all()
+    except Exception as e:
+        logging.error(f"Error reading items: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")

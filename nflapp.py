@@ -3,18 +3,18 @@ import sys
 import time
 import asyncio
 import logging
-import sqlite3
-import threading
-from datetime import datetime
-from typing import List, Optional, Callable, Dict, Any, Tuple
+from typing import List, Optional, Callable, Dict, Any, cast
 from dataclasses import dataclass, field
 import aiohttp
 from argon2 import PasswordHasher
 from argon2.exceptions import VerifyMismatchError
+from sqlalchemy import select, update, func
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
+from app_config import config
+from models import Base, DBUser, DBHotTake, DBPrediction, DBPredictionOutcome
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s',
                     handlers=[logging.StreamHandler(sys.stdout)])
-DB_NAME = os.getenv("NFL_DB_NAME", "nfl_app.db")
 
 
 class User:
@@ -23,27 +23,6 @@ class User:
         self.username = username.strip()
         self.password_hash = password_hash
         self.score = score
-
-    @staticmethod
-    def get_user(username: str, conn: sqlite3.Connection) -> Optional['User']:
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT id, username, password_hash, score FROM users WHERE username=?", (username.strip(),))
-        user_data = cursor.fetchone()
-        if user_data:
-            return User(db_id=user_data[0], username=user_data[1], password_hash=user_data[2], score=user_data[3])
-        return None
-
-    def save(self, conn: sqlite3.Connection):
-        cursor = conn.cursor()
-        if self.id is None:
-            cursor.execute("INSERT INTO users (username, password_hash, score) VALUES (?, ?, ?)",
-                           (self.username, self.password_hash, self.score))
-            self.id = cursor.lastrowid
-        else:
-            cursor.execute("UPDATE users SET username=?, password_hash=?, score=? WHERE id=?",
-                           (self.username, self.password_hash, self.score, self.id))
-        conn.commit()
 
 
 @dataclass
@@ -141,108 +120,74 @@ class API:
 
 class Database:
     def __init__(self):
-        self.conn = sqlite3.connect(DB_NAME, check_same_thread=False)
-        self.lock = threading.Lock()
-        self.create_tables()
+        self.engine = create_async_engine(config.DATABASE_URL)
+        self.async_session = async_sessionmaker(
+            bind=self.engine, expire_on_commit=False, class_=AsyncSession)
 
-    def create_tables(self):
-        with self.lock:
-            with self.conn:
-                self.conn.execute("""
-                    CREATE TABLE IF NOT EXISTS users (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        username TEXT UNIQUE,
-                        password_hash TEXT,
-                        score REAL DEFAULT 0
-                    )
-                """)
-                self.conn.execute("""
-                    CREATE TABLE IF NOT EXISTS hot_takes (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        user TEXT,
-                        text TEXT,
-                        votes INTEGER,
-                        downvotes INTEGER,
-                        created_at REAL
-                    )
-                """)
-                self.conn.execute("""
-                    CREATE TABLE IF NOT EXISTS predictions (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        user TEXT,
-                        game_id TEXT,
-                        game_name TEXT,
-                        pred_home INTEGER,
-                        pred_away INTEGER,
-                        actual_home INTEGER DEFAULT NULL,
-                        actual_away INTEGER DEFAULT NULL,
-                        error INTEGER DEFAULT NULL
-                    )
-                """)
-                self.conn.execute("""
-                    CREATE TABLE IF NOT EXISTS prediction_outcomes (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        username TEXT,
-                        game_id TEXT,
-                        pred_home INTEGER,
-                        pred_away INTEGER,
-                        actual_home INTEGER,
-                        actual_away INTEGER,
-                        is_correct INTEGER
-                    )
-                """)
+    async def create_tables(self):
+        async with self.engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
 
-    def save_take(self, take: HotTake):
-        with self.lock:
-            with self.conn:
-                cur = self.conn.execute("INSERT INTO hot_takes (user, text, votes, downvotes, created_at) VALUES (?, ?, ?, ?, ?)", (
-                    take.user, take.text, take.votes, take.downvotes, take.created_at))
-                take.id = cur.lastrowid
+    async def save_take(self, take: HotTake):
+        async with self.async_session() as session:
+            db_take = DBHotTake(user=take.user, text=take.text, votes=take.votes,
+                                downvotes=take.downvotes, created_at=take.created_at)
+            session.add(db_take)
+            await session.commit()
+            take.id = cast(int, db_take.id)
 
-    def update_votes(self, take_id: int, votes: int, downvotes: int):
-        with self.lock:
-            with self.conn:
-                self.conn.execute(
-                    "UPDATE hot_takes SET votes=?, downvotes=? WHERE id=?", (votes, downvotes, take_id))
+    async def update_votes(self, take_id: int, votes: int, downvotes: int):
+        async with self.async_session() as session:
+            await session.execute(update(DBHotTake).where(DBHotTake.id == take_id).values(votes=votes, downvotes=downvotes))
+            await session.commit()
 
-    def get_takes(self) -> List[HotTake]:
-        with self.lock:
-            rows = self.conn.execute(
-                "SELECT id, user, text, votes, downvotes, created_at FROM hot_takes").fetchall()
-        return [HotTake(id=r[0], user=r[1], text=r[2], votes=r[3], downvotes=r[4], created_at=r[5]) for r in rows]
+    async def get_takes(self) -> List[HotTake]:
+        async with self.async_session() as session:
+            result = await session.execute(select(DBHotTake))
+            rows = result.scalars().all()
+        return [HotTake(
+            id=cast(Optional[int], r.id),
+            user=cast(str, r.user),
+            text=cast(str, r.text),
+            votes=cast(int, r.votes),
+            downvotes=cast(int, r.downvotes),
+            created_at=cast(float, r.created_at),
+        ) for r in rows]
 
-    def save_prediction(self, user: str, game_id: str, game_name: str, home: int, away: int):
-        with self.lock:
-            with self.conn:
-                cur = self.conn.cursor()
-                cur.execute(
-                    "SELECT id FROM predictions WHERE user=? AND game_id=? AND error IS NULL", (user, game_id))
-                existing = cur.fetchone()
-                if existing:
-                    self.conn.execute(
-                        "UPDATE predictions SET pred_home=?, pred_away=? WHERE id=?", (home, away, existing[0]))
-                else:
-                    self.conn.execute("INSERT INTO predictions (user, game_id, game_name, pred_home, pred_away) VALUES (?, ?, ?, ?, ?)", (
-                        user, game_id, game_name, home, away))
+    async def save_prediction(self, user: str, game_id: str, game_name: str, home: int, away: int):
+        async with self.async_session() as session:
+            result = await session.execute(select(DBPrediction).where(DBPrediction.user == user, DBPrediction.game_id == game_id, DBPrediction.error == None))
+            existing = result.scalar_one_or_none()
+            if existing:
+                setattr(existing, "pred_home", home)
+                setattr(existing, "pred_away", away)
+            else:
+                session.add(DBPrediction(user=user, game_id=game_id,
+                            game_name=game_name, pred_home=home, pred_away=away))
+            await session.commit()
 
-    def settle_predictions(self, game_id: str, home: int, away: int):
-        with self.lock:
-            with self.conn:
-                rows = self.conn.execute(
-                    "SELECT id, pred_home, pred_away, user FROM predictions WHERE game_id=? AND error IS NULL", (game_id,)).fetchall()
-                for r in rows:
-                    pid, ph, pa, username = r
-                    error = abs(ph - home) + abs(pa - away)
-                    self.conn.execute(
-                        "UPDATE predictions SET actual_home=?, actual_away=?, error=? WHERE id=?", (home, away, error, pid))
-                    is_correct = 1 if (ph == home and pa == away) else 0
-                    self.conn.execute("INSERT INTO prediction_outcomes (username, game_id, pred_home, pred_away, actual_home, actual_away, is_correct) VALUES (?, ?, ?, ?, ?, ?, ?)", (
-                        username, game_id, ph, pa, home, away, is_correct))
+    async def settle_predictions(self, game_id: str, home: int, away: int):
+        async with self.async_session() as session:
+            result = await session.execute(select(DBPrediction).where(DBPrediction.game_id == game_id, DBPrediction.error == None))
+            rows = result.scalars().all()
+            for r in rows:
+                setattr(r, "actual_home", home)
+                setattr(r, "actual_away", away)
+                # use SQL ABS to operate safely on ColumnElements
+                setattr(r, "error", func.abs(r.pred_home - home) +
+                        func.abs(r.pred_away - away))
+                pred_home = cast(int, r.pred_home)
+                pred_away = cast(int, r.pred_away)
+                is_correct = 1 if (
+                    pred_home == home and pred_away == away) else 0
+                session.add(DBPredictionOutcome(username=r.user, game_id=game_id, pred_home=pred_home,
+                            pred_away=pred_away, actual_home=home, actual_away=away, is_correct=is_correct))
+            await session.commit()
 
-    def get_user_performance(self, username: str) -> Dict[str, int]:
-        with self.lock:
-            results = self.conn.execute(
-                "SELECT is_correct, COUNT(*) FROM prediction_outcomes WHERE username = ? GROUP BY is_correct", (username,)).fetchall()
+    async def get_user_performance(self, username: str) -> Dict[str, int]:
+        async with self.async_session() as session:
+            result = await session.execute(select(DBPredictionOutcome.is_correct, func.count(DBPredictionOutcome.id)).where(DBPredictionOutcome.username == username).group_by(DBPredictionOutcome.is_correct))
+            results = result.all()
         performance = {'total_predictions': 0,
                        'correct_predictions': 0, 'incorrect_predictions': 0}
         for row in results:
@@ -253,11 +198,11 @@ class Database:
             performance['total_predictions'] += row[1]
         return performance
 
-    def leaderboard(self) -> List[Dict[str, Any]]:
-        with self.lock:
-            rows = self.conn.execute(
-                "SELECT user, COUNT(*), AVG(error) FROM predictions WHERE error IS NOT NULL GROUP BY user ORDER BY AVG(error) ASC LIMIT 20").fetchall()
-        return [{"user": r[0], "total": r[1], "avg_error": r[2]} for r in rows]
+    async def leaderboard(self) -> List[Dict[str, Any]]:
+        async with self.async_session() as session:
+            result = await session.execute(select(DBPrediction.user, func.count(DBPrediction.id), func.avg(DBPrediction.error)).where(DBPrediction.error != None).group_by(DBPrediction.user).order_by(func.avg(DBPrediction.error).asc()).limit(20))
+            rows = result.all()
+        return [{"user": r[0], "total": r[1], "avg_error": float(r[2])} for r in rows]
 
 
 class NFLApp:
@@ -276,12 +221,20 @@ class NFLApp:
         if not username:
             return
         password = input("Enter password: ").strip()
-        user = User.get_user(username, self.db.conn)
-        if user and self.crypto.verify_password(password, user.password_hash):
-            self.current_user = user
+        async with self.db.async_session() as session:
+            res = await session.execute(select(DBUser).where(DBUser.username == username.strip()))
+            db_user = res.scalars().one_or_none()
+        if db_user and self.crypto.verify_password(password, cast(str, db_user.password_hash)):
+            self.current_user = User(
+                db_id=cast(int, db_user.id),
+                username=cast(str, db_user.username),
+                password_hash=cast(str, db_user.password_hash),
+                score=cast(
+                    float, db_user.score) if db_user.score is not None else 0.0,
+            )
             print(f"\nLogged in safely as: {username}")
         else:
-            if not user:
+            if not db_user:
                 choice = input(
                     "\nUser profile absent. Initialize account credentials row? (y/n): ").strip().lower()
                 if choice == 'y':
@@ -290,10 +243,16 @@ class NFLApp:
                             "Password size error: Selection length falls short of 6 characters threshold.")
                         return
                     hashed_pw = self.crypto.hash_password(password)
-                    new_user = User(db_id=None, username=username,
-                                    password_hash=hashed_pw)
-                    new_user.save(self.db.conn)
-                    self.current_user = new_user
+                    async with self.db.async_session() as session:
+                        new_db_user = DBUser(
+                            username=username, password_hash=hashed_pw)
+                        session.add(new_db_user)
+                        await session.commit()
+                        self.current_user = User(
+                            db_id=cast(int, new_db_user.id),
+                            username=cast(str, new_db_user.username),
+                            password_hash=cast(str, new_db_user.password_hash),
+                        )
                     print(f"User matrix registered. Logged in as {username}")
             else:
                 print("Invalid authentication parameters.")
@@ -341,8 +300,7 @@ class NFLApp:
                     input(f"Enter predicted score for {target['AwayTeam']}: "))
                 pred_home = int(
                     input(f"Enter predicted score for {target['HomeTeam']}: "))
-                self.db.save_prediction(
-                    user=self.current_user.username, game_id=target['game_id'], game_name=target['game_name'], home=pred_home, away=pred_away)
+                await self.db.save_prediction(user=self.current_user.username, game_id=target['game_id'], game_name=target['game_name'], home=pred_home, away=pred_away)
                 print("Game prediction records logged successfully.")
             else:
                 print("Selection context out of bounds.")
@@ -357,12 +315,11 @@ class NFLApp:
             return
         for g in games:
             if g['AwayScore'] > 0 or g['HomeScore'] > 0:
-                self.db.settle_predictions(
-                    g['game_id'], g['HomeScore'], g['AwayScore'])
+                await self.db.settle_predictions(g['game_id'], g['HomeScore'], g['AwayScore'])
         print("Data updates verified.")
 
-    def show_prediction_leaderboard(self):
-        leaders = self.db.leaderboard()
+    async def show_prediction_leaderboard(self):
+        leaders = await self.db.leaderboard()
         print("\n=== ACCURACY LEADERBOARD (LOWER ERROR IS BETTER) ===")
         if not leaders:
             print("No settled prediction records parsed in the current system timeline.")
@@ -371,12 +328,12 @@ class NFLApp:
             print(
                 f"{i}. User: {row['user']} | Settled Games: {row['total']} | Avg Error Point Margin: {row['avg_error']:.2f}")
 
-    def display_current_user_performance(self):
+    async def display_current_user_performance(self):
         if not self.current_user:
             print(
                 "Authentication routing blocked: Login required to review profile performance.")
             return
-        perf = self.db.get_user_performance(self.current_user.username)
+        perf = await self.db.get_user_performance(self.current_user.username)
         print(f"\nUser: {self.current_user.username}")
         print(f"Total Predictions: {perf['total_predictions']}")
         if perf['total_predictions'] > 0:
@@ -398,12 +355,12 @@ class NFLApp:
         take = HotTake(user=self.current_user.username, text=text)
         for hook in self.hooks:
             hook(take)
-        self.db.save_take(take)
+        await self.db.save_take(take)
         print("Hot take broadcast verified.")
 
-    def show_takes(self) -> List[HotTake]:
+    async def show_takes(self) -> List[HotTake]:
         print("\n=== HOT TAKES RANKED BY TIME-DECAY POPULARITY ===")
-        takes = self.db.get_takes()
+        takes = await self.db.get_takes()
         ranked = sorted(takes, key=lambda t: t.ranking_score(), reverse=True)
         if not ranked:
             print(
@@ -414,7 +371,7 @@ class NFLApp:
         return ranked
 
     async def vote_take_interface(self, direction: str):
-        ranked = self.show_takes()
+        ranked = await self.show_takes()
         if not ranked:
             return
         try:
@@ -429,7 +386,7 @@ class NFLApp:
                 if target.id is None:
                     print("Unable to update vote record: invalid take identifier.")
                     return
-                self.db.update_votes(target.id, target.votes, target.downvotes)
+                await self.db.update_votes(target.id, target.votes, target.downvotes)
                 print(
                     f"{direction.capitalize()}vote logged matrix records update complete.")
             else:
@@ -438,6 +395,7 @@ class NFLApp:
             print("Numeric validation expected.")
 
     async def menu(self):
+        await self.db.create_tables()
         while True:
             profile_tag = self.current_user.username if self.current_user else "Unauthenticated Guest"
             print(f"\n================ NFL CORE APP ENGINE ================")
@@ -465,11 +423,11 @@ class NFLApp:
             elif choice == "4":
                 await self.make_prediction()
             elif choice == "5":
-                self.show_prediction_leaderboard()
+                await self.show_prediction_leaderboard()
             elif choice == "6":
-                self.display_current_user_performance()
+                await self.display_current_user_performance()
             elif choice == "7":
-                self.show_takes()
+                await self.show_takes()
             elif choice == "8":
                 await self.add_take()
             elif choice == "9":
@@ -494,8 +452,3 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         sys.exit(0)
-
-
-def create_components():
-    engine = NFLApp()
-    return engine.db, engine.api, engine.crypto
