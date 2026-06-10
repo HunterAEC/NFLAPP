@@ -1,0 +1,22 @@
+# SQLite Database binaries
+*.db
+*.sqlite3
+
+# Python virtual environment directories
+.venv/
+venv/
+env/
+nfl-app-env/
+
+# Python caching bytecodes
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Mac system configuration footprints
+.DS_Store
+
+# IDE / Editor configuration directories
+.vscode/
+.idea/
