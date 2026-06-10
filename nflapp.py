@@ -16,6 +16,10 @@ from models import Base, DBUser, DBHotTake, DBPrediction, DBPredictionOutcome
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s',
                     handlers=[logging.StreamHandler(sys.stdout)])
 
+# welcome I new to this and programming in general, let me know what you think.
+# Hi Rey, this might suck but I am learning. Hunter Out
+# Go Raiders, Mendoza for rookie of the year
+
 
 class User:
     def __init__(self, db_id: Optional[int], username: str, password_hash: str, score: float = 0.0):
